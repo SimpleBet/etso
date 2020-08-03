@@ -1,6 +1,11 @@
 defmodule Etso.Adapter.Behaviour.Queryable do
   @moduledoc false
 
+  Module.register_attribute(__MODULE__, :telemetry_event,
+        accumulate: true,
+        persist: true
+      )
+
   alias Etso.Adapter.TableRegistry
   alias Etso.ETS.MatchSpecification
 
@@ -9,11 +14,35 @@ defmodule Etso.Adapter.Behaviour.Queryable do
   end
 
   def execute(%{repo: repo}, _, {:nocache, query}, params, _) do
+    start_time = System.monotonic_time()
+
     {_, schema} = query.from.source
     {:ok, ets_table} = TableRegistry.get_table(repo, schema)
     ets_match = MatchSpecification.build(query, params)
-    ets_objects = :ets.select(ets_table, [ets_match])
-    {length(ets_objects), ets_objects}
+    start_metadata = %{
+      type: :etso_query,
+      repo: repo,
+      params: params,
+      query: ets_match,
+      source: schema
+    }
+
+    try do
+      :telemetry.execute([:ecto, :query, :start], %{system_time: System.system_time()}, start_metadata)
+      :ets.select(ets_table, [ets_match])
+    catch
+      kind, reason ->
+        stacktrace = __STACKTRACE__
+        metadata = %{kind: kind, reason: reason, stacktrace: stacktrace}
+        :telemetry.execute([:ecto, :query, :exception], %{duration: System.monotonic_time() - start_time}, metadata)
+        :erlang.raise(kind, reason, stacktrace)
+    else
+      ets_objects ->
+        object_count = length(ets_objects)
+        stop_metadata = Map.put(start_metadata, :result, ets_objects)
+        :telemetry.execute([:ecto, :query, :stop], %{duration: System.monotonic_time() - start_time}, stop_metadata)
+        {object_count, ets_objects}
+    end
   end
 
   def stream(%{repo: repo}, _, {:nocache, query}, params, options) do
